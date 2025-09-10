@@ -1,0 +1,762 @@
+// MyPocketApp.kt
+// This is a single-file, self-contained example of a personal finance tracker app.
+// It demonstrates key modern Android development practices using Kotlin and Jetpack.
+//
+// To make this file runnable in Android Studio, add the following dependencies to your
+// app-level build.gradle.kts file:
+//
+// dependencies {
+//     // Core Android
+//     implementation("androidx.core:core-ktx:1.10.1")
+//     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.1")
+//     
+//     // Jetpack Compose
+//     implementation("androidx.activity:activity-compose:1.7.2")
+//     implementation(platform("androidx.compose:compose-bom:2023.03.00"))
+//     implementation("androidx.compose.ui:ui")
+//     implementation("androidx.compose.ui:ui-graphics")
+//     implementation("androidx.compose.ui:ui-tooling-preview")
+//     implementation("androidx.compose.material3:material3")
+//     implementation("androidx.compose.material:material-icons-extended")
+//
+//     // Room Database
+//     implementation("androidx.room:room-runtime:2.5.2")
+//     ksp("androidx.room:room-compiler:2.5.2")
+//     implementation("androidx.room:room-ktx:2.5.2")
+//
+//     // ViewModel and LiveData
+//     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.6.1")
+//
+//     // MPAndroidChart for graphing (add JitPack repository to settings.gradle)
+//     implementation("com.github.PhilJay:MPAndroidChart:v3.1.0")
+// }
+//
+// plugins {
+//     id("com.android.application")
+//     id("org.jetbrains.kotlin.android")
+//     id("com.google.devtools.ksp")
+// }
+//
+// Add this to your settings.gradle.kts file:
+// dependencyResolutionManagement {
+//     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+//     repositories {
+//         google()
+//         mavenCentral()
+//         maven { url = uri("https://jitpack.io") }
+//     }
+// }
+
+import android.content.Context
+import android.content.Intent
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Typeface
+import android.graphics.drawable.Drawable
+import android.graphics.pdf.PdfDocument
+import android.net.Uri
+import android.os.Bundle
+import android.os.Environment
+import android.provider.DocumentsContract
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.PieChart
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.livedata.observeAsState
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.room.*
+import com.github.mikephil.charting.charts.BarChart
+import com.github.mikephil.charting.data.BarData
+import com.github.mikephil.charting.data.BarDataSet
+import com.github.mikephil.charting.data.BarEntry
+import com.github.mikephil.charting.formatter.IndexAxisValueFormatter
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.launch
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.*
+
+/**
+ * ==============================================================================================
+ * Data Model and Database (MVVM)
+ * ==============================================================================================
+ */
+
+/**
+ * The core data model for a single transaction.
+ * This class is also the Room Entity, representing a table in the local database.
+ */
+@Entity(tableName = "transactions")
+data class Transaction(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val amount: Double,
+    val category: String,
+    val date: Long,
+    val description: String,
+    val isExpense: Boolean
+)
+
+/**
+ * Data Access Object (DAO) for the Transaction entity.
+ * This interface defines the methods for interacting with the transactions table.
+ */
+@Dao
+interface TransactionDao {
+    @Insert
+    suspend fun insert(transaction: Transaction)
+
+    @Query("SELECT * FROM transactions ORDER BY date DESC")
+    fun getAllTransactions(): Flow<List<Transaction>>
+
+    @Query("SELECT SUM(amount) FROM transactions WHERE date BETWEEN :startDate AND :endDate AND isExpense = 0")
+    fun getMonthlyIncome(startDate: Long, endDate: Long): Flow<Double?>
+
+    @Query("SELECT SUM(amount) FROM transactions WHERE date BETWEEN :startDate AND :endDate AND isExpense = 1")
+    fun getMonthlyExpenses(startDate: Long, endDate: Long): Flow<Double?>
+
+    @Query("SELECT category, SUM(amount) AS total FROM transactions WHERE date BETWEEN :startDate AND :endDate AND isExpense = 1 GROUP BY category ORDER BY total DESC")
+    fun getMonthlySpendingByCategory(startDate: Long, endDate: Long): Flow<List<CategorySpending>>
+}
+
+data class CategorySpending(
+    val category: String,
+    val total: Double
+)
+
+/**
+ * The Room database class.
+ * This abstract class serves as the main access point to the underlying SQLite database.
+ * It's a singleton to prevent multiple instances from being created.
+ */
+@Database(entities = [Transaction::class], version = 1, exportSchema = false)
+abstract class TransactionDatabase : RoomDatabase() {
+    abstract fun transactionDao(): TransactionDao
+
+    companion object {
+        @Volatile
+        private var INSTANCE: TransactionDatabase? = null
+
+        fun getDatabase(context: Context): TransactionDatabase {
+            return INSTANCE ?: synchronized(this) {
+                val instance = Room.databaseBuilder(
+                    context.applicationContext,
+                    TransactionDatabase::class.java,
+                    "transaction_database"
+                ).build()
+                INSTANCE = instance
+                instance
+            }
+        }
+    }
+}
+
+/**
+ * Repository class.
+ * This class abstracts the data source and provides a clean API for the ViewModel.
+ */
+class TransactionRepository(private val transactionDao: TransactionDao) {
+    val allTransactions: Flow<List<Transaction>> = transactionDao.getAllTransactions()
+
+    suspend fun insert(transaction: Transaction) {
+        transactionDao.insert(transaction)
+    }
+
+    fun getMonthlyIncome(startDate: Long, endDate: Long) = transactionDao.getMonthlyIncome(startDate, endDate)
+    fun getMonthlyExpenses(startDate: Long, endDate: Long) = transactionDao.getMonthlyExpenses(startDate, endDate)
+    fun getMonthlySpendingByCategory(startDate: Long, endDate: Long) = transactionDao.getMonthlySpendingByCategory(startDate, endDate)
+}
+
+/**
+ * ViewModel for the app.
+ * This class prepares and manages the data for the UI. It survives configuration changes.
+ */
+class TransactionViewModel(private val repository: TransactionRepository) : ViewModel() {
+
+    // LiveData to be observed by the UI
+    val allTransactions = repository.allTransactions.asLiveData()
+
+    /**
+     * Inserts a new transaction into the database.
+     */
+    fun insert(transaction: Transaction) = viewModelScope.launch {
+        repository.insert(transaction)
+    }
+
+    /**
+     * Combines income and expenses for a given day into a single Flow.
+     */
+    fun getDailySummary(dayStart: Long, dayEnd: Long): Flow<Pair<Double, Double>> {
+        val income = repository.getMonthlyIncome(dayStart, dayEnd)
+        val expenses = repository.getMonthlyExpenses(dayStart, dayEnd)
+        return combine(income, expenses) { inc, exp ->
+            Pair(inc ?: 0.0, exp ?: 0.0)
+        }
+    }
+}
+
+/**
+ * ViewModel factory to instantiate the ViewModel with the repository.
+ */
+class TransactionViewModelFactory(private val repository: TransactionRepository) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(TransactionViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return TransactionViewModel(repository) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class")
+    }
+}
+
+/**
+ * ==============================================================================================
+ * UI Components (Jetpack Compose)
+ * ==============================================================================================
+ */
+
+// Define available screens in the app
+private enum class Screen {
+    HOME, DAILY_OVERVIEW, MONTHLY_REPORT
+}
+
+@Composable
+fun MyPocketApp() {
+    val context = LocalContext.current
+    val db = remember { TransactionDatabase.getDatabase(context) }
+    val repository = remember { TransactionRepository(db.transactionDao()) }
+    val viewModel: TransactionViewModel = viewModel(factory = TransactionViewModelFactory(repository))
+
+    var currentScreen by remember { mutableStateOf(Screen.HOME) }
+
+    Scaffold(
+        bottomBar = {
+            NavigationBar(
+                modifier = Modifier.clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
+            ) {
+                NavigationBarItem(
+                    selected = currentScreen == Screen.HOME,
+                    onClick = { currentScreen = Screen.HOME },
+                    icon = { Icon(Icons.Default.Add, contentDescription = "Add Transaction") },
+                    label = { Text("Log") }
+                )
+                NavigationBarItem(
+                    selected = currentScreen == Screen.DAILY_OVERVIEW,
+                    onClick = { currentScreen = Screen.DAILY_OVERVIEW },
+                    icon = { Icon(Icons.Default.List, contentDescription = "Daily Overview") },
+                    label = { Text("Daily") }
+                )
+                NavigationBarItem(
+                    selected = currentScreen == Screen.MONTHLY_REPORT,
+                    onClick = { currentScreen = Screen.MONTHLY_REPORT },
+                    icon = { Icon(Icons.Default.PieChart, contentDescription = "Monthly Report") },
+                    label = { Text("Monthly") }
+                )
+            }
+        }
+    ) { innerPadding ->
+        Box(modifier = Modifier.padding(innerPadding)) {
+            when (currentScreen) {
+                Screen.HOME -> MainScreen(viewModel)
+                Screen.DAILY_OVERVIEW -> DailyOverviewScreen(viewModel)
+                Screen.MONTHLY_REPORT -> MonthlyReportScreen(viewModel)
+            }
+        }
+    }
+}
+
+@Composable
+fun MainScreen(viewModel: TransactionViewModel) {
+    val context = LocalContext.current
+    var amount by remember { mutableStateOf("") }
+    var description by remember { mutableStateOf("") }
+    var isExpense by remember { mutableStateOf(true) }
+    var selectedCategory by remember { mutableStateOf("Food") }
+    val categories = listOf("Food", "Transport", "Rent", "Entertainment", "Utilities", "Salary", "Other")
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Top
+    ) {
+        Text(
+            text = "MyPocket",
+            style = MaterialTheme.typography.headlineLarge,
+            modifier = Modifier.padding(bottom = 16.dp)
+        )
+
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            shape = RoundedCornerShape(16.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Income", modifier = Modifier.padding(8.dp).clickable { isExpense = false },
+                        color = if (!isExpense) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
+                    Spacer(Modifier.width(16.dp))
+                    Text("Expense", modifier = Modifier.padding(8.dp).clickable { isExpense = true },
+                        color = if (isExpense) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                OutlinedTextField(
+                    value = amount,
+                    onValueChange = { amount = it },
+                    label = { Text("Amount") },
+                    modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = description,
+                    onValueChange = { description = it },
+                    label = { Text("Description") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                // Simple dropdown for categories
+                var expanded by remember { mutableStateOf(false) }
+                ExposedDropdownMenuBox(
+                    expanded = expanded,
+                    onExpandedChange = { expanded = !expanded }
+                ) {
+                    OutlinedTextField(
+                        value = selectedCategory,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("Category") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .menuAnchor()
+                    )
+                    ExposedDropdownMenu(
+                        expanded = expanded,
+                        onDismissRequest = { expanded = false }
+                    ) {
+                        categories.forEach { category ->
+                            DropdownMenuItem(
+                                text = { Text(category) },
+                                onClick = {
+                                    selectedCategory = category
+                                    expanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                Button(
+                    onClick = {
+                        val newTransaction = Transaction(
+                            amount = amount.toDoubleOrNull() ?: 0.0,
+                            category = selectedCategory,
+                            date = System.currentTimeMillis(),
+                            description = description,
+                            isExpense = isExpense
+                        )
+                        viewModel.insert(newTransaction)
+                        // Clear fields after adding
+                        amount = ""
+                        description = ""
+                        selectedCategory = "Food"
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp)
+                ) {
+                    Text("Add Transaction")
+                }
+            }
+        }
+        
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Display recent transactions
+        val transactions by viewModel.allTransactions.observeAsState(emptyList())
+        LazyColumn(modifier = Modifier.fillMaxWidth()) {
+            items(transactions) { transaction ->
+                TransactionItem(transaction)
+            }
+        }
+    }
+}
+
+@Composable
+fun TransactionItem(transaction: Transaction) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        shape = RoundedCornerShape(8.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column {
+                Text(
+                    text = transaction.description,
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Text(
+                    text = transaction.category,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                )
+            }
+            Text(
+                text = "${if (transaction.isExpense) "-" else "+"} \$${"%.2f".format(transaction.amount)}",
+                style = MaterialTheme.typography.titleMedium,
+                color = if (transaction.isExpense) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+            )
+        }
+    }
+}
+
+@Composable
+fun DailyOverviewScreen(viewModel: TransactionViewModel) {
+    val today = Calendar.getInstance()
+    today.set(Calendar.HOUR_OF_DAY, 0)
+    today.set(Calendar.MINUTE, 0)
+    today.set(Calendar.SECOND, 0)
+    today.set(Calendar.MILLISECOND, 0)
+    val dayStart = today.timeInMillis
+    today.set(Calendar.HOUR_OF_DAY, 23)
+    today.set(Calendar.MINUTE, 59)
+    today.set(Calendar.SECOND, 59)
+    today.set(Calendar.MILLISECOND, 999)
+    val dayEnd = today.timeInMillis
+
+    val dailySummary by viewModel.getDailySummary(dayStart, dayEnd).collectAsState(initial = Pair(0.0, 0.0))
+    val totalIncome = dailySummary.first
+    val totalExpenses = dailySummary.second
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text("Daily Overview", style = MaterialTheme.typography.headlineMedium)
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Simple text summary
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            elevation = CardDefaults.cardElevation(8.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("Today's Income: $${"%.2f".format(totalIncome)}", style = MaterialTheme.typography.bodyLarge)
+                Text("Today's Expenses: $${"%.2f".format(totalExpenses)}", style = MaterialTheme.typography.bodyLarge)
+            }
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+
+        if (totalIncome > 0 || totalExpenses > 0) {
+            DailyBarChart(totalIncome, totalExpenses)
+        } else {
+            Text("No transactions for today.", modifier = Modifier.padding(16.dp))
+        }
+    }
+}
+
+@Composable
+fun DailyBarChart(income: Double, expenses: Double) {
+    val barEntries = listOf(
+        BarEntry(1f, income.toFloat()),
+        BarEntry(2f, expenses.toFloat())
+    )
+    val labels = listOf("Income", "Expenses")
+
+    AndroidView(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(250.dp)
+            .padding(16.dp)
+            .background(Color.Transparent),
+        factory = { context ->
+            BarChart(context).apply {
+                description.isEnabled = false
+                legend.isEnabled = false
+                xAxis.setDrawGridLines(false)
+                axisLeft.setDrawGridLines(false)
+                axisRight.setDrawGridLines(false)
+                xAxis.valueFormatter = IndexAxisValueFormatter(labels)
+                xAxis.granularity = 1f
+                xAxis.setCenterAxisLabels(true)
+                setFitBars(true)
+            }
+        },
+        update = { barChart ->
+            val dataSet = BarDataSet(barEntries, "Daily Summary").apply {
+                colors = listOf(Color.GREEN, Color.RED)
+            }
+            barChart.data = BarData(dataSet)
+            barChart.invalidate()
+        }
+    )
+}
+
+@Composable
+fun MonthlyReportScreen(viewModel: TransactionViewModel) {
+    val context = LocalContext.current
+    val today = Calendar.getInstance()
+    val monthStart = today.apply { set(Calendar.DAY_OF_MONTH, 1); set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0) }.timeInMillis
+    val monthEnd = today.apply { set(Calendar.DAY_OF_MONTH, getActualMaximum(Calendar.DAY_OF_MONTH)); set(Calendar.HOUR_OF_DAY, 23); set(Calendar.MINUTE, 59); set(Calendar.SECOND, 59); set(Calendar.MILLISECOND, 999) }.timeInMillis
+
+    val spendingByCategory by viewModel.repository.getMonthlySpendingByCategory(monthStart, monthEnd).collectAsState(initial = emptyList())
+    val monthlyExpenses by viewModel.repository.getMonthlyExpenses(monthStart, monthEnd).collectAsState(initial = 0.0)
+
+    val pdfGenerator = remember { PdfGenerator() }
+    val launcher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/pdf"),
+        onResult = { uri: Uri? ->
+            uri?.let {
+                pdfGenerator.savePdf(context, it, monthlyExpenses, spendingByCategory)
+            }
+        }
+    )
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text("Monthly Report", style = MaterialTheme.typography.headlineMedium)
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Text("Total Monthly Expenses: $${"%.2f".format(monthlyExpenses)}", style = MaterialTheme.typography.titleLarge)
+        Spacer(modifier = Modifier.height(16.dp))
+
+        if (spendingByCategory.isNotEmpty()) {
+            SpendingBarChart(spendingByCategory)
+        } else {
+            Text("No expenses for this month.", modifier = Modifier.padding(16.dp))
+        }
+
+        Spacer(modifier = Modifier.height(32.dp))
+        Button(
+            onClick = {
+                val fileName = "MyPocket_Report_${SimpleDateFormat("yyyy-MM-dd").format(Date())}.pdf"
+                launcher.launch(fileName)
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Export Monthly Report as PDF")
+        }
+    }
+}
+
+@Composable
+fun SpendingBarChart(data: List<CategorySpending>) {
+    val barEntries = data.mapIndexed { index, item -> BarEntry(index.toFloat(), item.total.toFloat()) }
+    val labels = data.map { it.category }
+
+    AndroidView(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(300.dp)
+            .padding(16.dp),
+        factory = { context ->
+            BarChart(context).apply {
+                description.isEnabled = false
+                legend.isEnabled = true
+                xAxis.setDrawGridLines(false)
+                axisLeft.setDrawGridLines(false)
+                axisRight.setDrawGridLines(false)
+                xAxis.valueFormatter = IndexAxisValueFormatter(labels)
+                xAxis.granularity = 1f
+                xAxis.setCenterAxisLabels(false)
+                setFitBars(true)
+            }
+        },
+        update = { barChart ->
+            val dataSet = BarDataSet(barEntries, "Monthly Spending by Category").apply {
+                colors = listOf(
+                    Color.parseColor("#4285F4"), // Food
+                    Color.parseColor("#DB4437"), // Transport
+                    Color.parseColor("#F4B400"), // Rent
+                    Color.parseColor("#0F9D58"), // Entertainment
+                    Color.parseColor("#AB8B5A"), // Utilities
+                    Color.parseColor("#A3A3A3")  // Other
+                )
+            }
+            barChart.data = BarData(dataSet)
+            barChart.invalidate()
+        }
+    )
+}
+
+/**
+ * ==============================================================================================
+ * PDF Generation Logic
+ * ==============================================================================================
+ */
+
+class PdfGenerator {
+    fun savePdf(context: Context, uri: Uri, monthlyExpenses: Double, spendingByCategory: List<CategorySpending>) {
+        val document = PdfDocument()
+        val pageInfo = PdfDocument.PageInfo.Builder(595, 842, 1).create()
+        val page = document.startPage(pageInfo)
+        val canvas = page.canvas
+        val paint = Paint()
+
+        // Page title
+        paint.textSize = 24f
+        paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        canvas.drawText("MyPocket Monthly Report", 20f, 40f, paint)
+
+        // Monthly Summary
+        paint.textSize = 18f
+        paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
+        canvas.drawText("Total Expenses: $${"%.2f".format(monthlyExpenses)}", 20f, 80f, paint)
+
+        // Category breakdown
+        paint.textSize = 16f
+        var yPos = 120f
+        spendingByCategory.forEach {
+            canvas.drawText("${it.category}: $${"%.2f".format(it.total)}", 20f, yPos, paint)
+            yPos += 20f
+        }
+
+        // Simulating the chart drawing (conceptual)
+        // In a real app, you would render the chart View to a Bitmap and then draw the bitmap.
+        // For this example, we'll draw a simple bar chart representation directly on the canvas.
+        val chartHeight = 200f
+        val chartTop = yPos + 40f
+        val chartLeft = 20f
+        val chartRight = 575f
+        val maxTotal = spendingByCategory.maxOfOrNull { it.total }?.toFloat() ?: 1.0f
+
+        paint.color = Color.BLACK
+        canvas.drawText("Spending by Category", chartLeft, chartTop - 10, paint)
+
+        val barWidth = (chartRight - chartLeft) / (spendingByCategory.size * 2)
+        spendingByCategory.forEachIndexed { index, item ->
+            val barHeight = (item.total.toFloat() / maxTotal) * chartHeight
+            val barLeft = chartLeft + index * barWidth * 2
+            val barRight = barLeft + barWidth
+
+            // Set a different color for each bar for visual distinction
+            val barColor = when(item.category) {
+                "Food" -> Color.parseColor("#4285F4")
+                "Transport" -> Color.parseColor("#DB4437")
+                "Rent" -> Color.parseColor("#F4B400")
+                "Entertainment" -> Color.parseColor("#0F9D58")
+                "Utilities" -> Color.parseColor("#AB8B5A")
+                else -> Color.parseColor("#A3A3A3")
+            }.toArgb()
+
+            paint.color = barColor
+            canvas.drawRect(barLeft, chartTop + chartHeight - barHeight, barRight, chartTop + chartHeight, paint)
+            
+            // Draw label
+            paint.color = Color.BLACK
+            paint.textSize = 12f
+            canvas.drawText(item.category, barLeft, chartTop + chartHeight + 15, paint)
+            canvas.drawText("$${"%.2f".format(item.total)}", barLeft, chartTop + chartHeight + 30, paint)
+        }
+
+        document.finishPage(page)
+
+        try {
+            context.contentResolver.openFileDescriptor(uri, "w")?.use { pfd ->
+                FileOutputStream(pfd.fileDescriptor).use { outputStream ->
+                    document.writeTo(outputStream)
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        } finally {
+            document.close()
+        }
+    }
+}
+
+/**
+ * ==============================================================================================
+ * Main Activity
+ * ==============================================================================================
+ */
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            // Apply a professional dark/light theme
+            val isDarkTheme = isSystemInDarkTheme()
+            val myPocketColorScheme = if (isDarkTheme) {
+                darkColorScheme(
+                    primary = Color(0xFF6A67F2),
+                    onPrimary = Color(0xFFFFFFFF),
+                    background = Color(0xFF121212),
+                    surface = Color(0xFF1E1E1E),
+                    onSurface = Color(0xFFFFFFFF),
+                    error = Color(0xFFCF6679)
+                )
+            } else {
+                lightColorScheme(
+                    primary = Color(0xFF6200EE),
+                    onPrimary = Color(0xFFFFFFFF),
+                    background = Color(0xFFF5F5F5),
+                    surface = Color(0xFFFFFFFF),
+                    onSurface = Color(0xFF1C1C1C),
+                    error = Color(0xFFB00020)
+                )
+            }
+
+            MaterialTheme(colorScheme = myPocketColorScheme) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    MyPocketApp()
+                }
+            }
+        }
+    }
+}
